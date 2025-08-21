@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 ClickUp Scaffolding for Fido Ticketing System
-- Idempotent creation of Space, Folder, Lists, and Custom Fields
+- Idempotent creation of Space, Folder, Lists, Custom Fields
 - Applies per-list custom status workflow
-- Exports IDs for Slack app consumption
-- Works locally or in GitHub Actions (secrets via env)
+- Exports IDs (config/clickupFields.json, clickup-env-vars.txt, clickup-config.json)
+- Works locally or in GitHub Actions (secrets via env); supports --dry-run and --discover-team
 
 USAGE (local):
   export CLICKUP_API_TOKEN=pk_xxx
   export CLICKUP_TEAM_ID=9013484736
   python3 clickup-api-setup-script.py
+
+USAGE (GitHub Actions):
+  - Add repo secrets CLICKUP_API_TOKEN, CLICKUP_TEAM_ID
+  - Use workflow to run this script
 
 Flags:
   --dry-run
@@ -24,9 +28,11 @@ import json
 import time
 import argparse
 from typing import Dict, Any, List, Optional
+
 import requests
 
-# ---------- Names (edit if you want to change display names) ----------
+# ---------------- Display Names (edit as needed) ----------------
+
 SPACE_NAME   = "Fido Operations"
 FOLDER_NAME  = "CX Tickets"
 LISTS = {
@@ -86,13 +92,14 @@ LIST_TO_FIELDS = {
     "units":     COMMON_FIELDS + UNIT_FIELDS
 }
 
-# ---------------------- HTTP helpers ----------------------
+# -------------------------- Helpers / HTTP --------------------------
 
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else v
 
 def http_headers(token: str) -> Dict[str, str]:
+    # ClickUp expects raw token in Authorization header (no "Bearer ")
     return {"Authorization": token, "Content-Type": "application/json"}
 
 def get_json(url: str, token: str, retry=3) -> Any:
@@ -128,102 +135,112 @@ def put_json(url: str, token: str, payload: Dict[str, Any], retry=3) -> Any:
 
 def print_step(msg: str): print(f"\n=== {msg}")
 
-# ----------------- Idempotent creators -----------------
+# ---------------------- Idempotent creators ----------------------
 
-def discover_teams(token: str):
+def discover_teams(token: str) -> List[Dict[str, Any]]:
     return get_json("https://api.clickup.com/api/v2/team", token).get("teams", [])
 
-def find_or_create_space(team_id: str, token: str, space_name: str, dry: bool):
+def find_or_create_space(team_id: str, token: str, space_name: str, dry: bool) -> Dict[str, Any]:
+    """Reliable space lookup + create using /team/{team_id}/space"""
     print_step(f"Space: lookup '{space_name}'")
-    teams = get_json("https://api.clickup.com/api/v2/team", token)["teams"]
-    for t in teams:
-        if str(t["id"]) == str(team_id):
-            for s in t.get("spaces", []):
-                if s["name"] == space_name:
-                    print(f"• Reusing space '{space_name}' ({s['id']})")
-                    return {"id": s["id"], "name": s["name"]}
+    list_url = f"https://api.clickup.com/api/v2/team/{team_id}/space"
+    spaces = get_json(list_url, token).get("spaces", [])
+    for s in spaces:
+        if s.get("name") == space_name:
+            print(f"• Reusing space '{space_name}' ({s['id']})")
+            return {"id": s["id"], "name": s["name"]}
+
     if dry:
         print(f"• DRY RUN: would create space '{space_name}'")
         return {"id": "DRY_SPACE_ID", "name": space_name}
-    res = post_json(f"https://api.clickup.com/api/v2/team/{team_id}/space", token,
-                    {"name": space_name, "multiple_assignees": True})
+
+    create_url = f"https://api.clickup.com/api/v2/team/{team_id}/space"
+    payload = {"name": space_name, "multiple_assignees": True}
+    res = post_json(create_url, token, payload)
     print(f"• Created space '{space_name}' ({res['id']})")
     return {"id": res["id"], "name": res["name"]}
 
-def find_or_create_folder(space_id: str, token: str, folder_name: str, dry: bool):
+def find_or_create_folder(space_id: str, token: str, folder_name: str, dry: bool) -> Dict[str, Any]:
     print_step(f"Folder: lookup '{folder_name}'")
-    folders = get_json(f"https://api.clickup.com/api/v2/space/{space_id}/folder", token).get("folders", [])
+    url = f"https://api.clickup.com/api/v2/space/{space_id}/folder"
+    folders = get_json(url, token).get("folders", [])
     for f in folders:
         if f["name"] == folder_name:
             print(f"• Reusing folder '{folder_name}' ({f['id']})")
             return {"id": f["id"], "name": f["name"]}
+
     if dry:
         print(f"• DRY RUN: would create folder '{folder_name}'")
         return {"id": "DRY_FOLDER_ID", "name": folder_name}
-    res = post_json(f"https://api.clickup.com/api/v2/space/{space_id}/folder", token, {"name": folder_name})
+
+    create_url = f"https://api.clickup.com/api/v2/space/{space_id}/folder"
+    res = post_json(create_url, token, {"name": folder_name})
     print(f"• Created folder '{folder_name}' ({res['id']})")
     return {"id": res["id"], "name": res["name"]}
 
-def find_or_create_list(folder_id: str, token: str, list_name: str, dry: bool):
+def find_or_create_list(folder_id: str, token: str, list_name: str, dry: bool) -> Dict[str, Any]:
     print_step(f"List: lookup '{list_name}'")
-    lists = get_json(f"https://api.clickup.com/api/v2/folder/{folder_id}/list", token).get("lists", [])
+    url = f"https://api.clickup.com/api/v2/folder/{folder_id}/list"
+    lists = get_json(url, token).get("lists", [])
     for l in lists:
         if l["name"] == list_name:
             print(f"• Reusing list '{list_name}' ({l['id']})")
             return {"id": l["id"], "name": l["name"]}
+
     if dry:
         print(f"• DRY RUN: would create list '{list_name}'")
         return {"id": f"DRY_{list_name.upper().replace(' ', '_')}", "name": list_name}
-    res = post_json(f"https://api.clickup.com/api/v2/folder/{folder_id}/list", token, {"name": list_name})
+
+    create_url = f"https://api.clickup.com/api/v2/folder/{folder_id}/list"
+    res = post_json(create_url, token, {"name": list_name})
     print(f"• Created list '{list_name}' ({res['id']})")
     return {"id": res["id"], "name": res["name"]}
 
-def get_list_fields(list_id: str, token: str):
-    return get_json(f"https://api/clickup.com/api/v2/list/{list_id}/field".replace("/api/clickup", "/api.clickup"), token).get("fields", [])
+def get_list_fields(list_id: str, token: str) -> List[Dict[str, Any]]:
+    """Correct endpoint for listing custom fields on a list."""
+    url = f"https://api.clickup.com/api/v2/list/{list_id}/field"
+    data = get_json(url, token)
+    return data.get("fields", [])
 
-def find_field_by_name(fields, name: str):
+def find_field_by_name(fields: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
     for f in fields:
         if f.get("name") == name:
             return f
     return None
 
-def create_custom_field(list_id: str, token: str, field_def: Dict[str, Any], dry: bool):
+def create_custom_field(list_id: str, token: str, field_def: Dict[str, Any], dry: bool) -> Dict[str, Any]:
+    """Create a custom field on the list via POST /list/{list_id}/field."""
     if dry:
         print(f"• DRY RUN: would create field '{field_def['name']}' ({field_def['type']}) on list {list_id}")
         dummy = {"id": f"DRY_CF_{field_def['name']}", "name": field_def["name"], "type": field_def["type"]}
         if field_def["type"] == "dropdown":
             dummy["type_config"] = {"options": [{"name": o, "id": f"DRY_OPT_{o}"} for o in field_def.get("options", [])]}
         return dummy
+
+    url = f"https://api.clickup.com/api/v2/list/{list_id}/field"
     payload = {"name": field_def["name"], "type": field_def["type"]}
     if field_def["type"] == "dropdown" and field_def.get("options"):
         payload["type_config"] = {"options": [{"name": o} for o in field_def["options"]]}
-    res = post_json(f"https://api.clickup.com/api/v2/list/{list_id}/field", token, payload)
+    res = post_json(url, token, payload)
     print(f"• Created field '{field_def['name']}' ({res['id']})")
     return res
 
 def apply_status_workflow_to_list(list_id: str, token: str, statuses: List[Dict[str, Any]], dry: bool):
-    """
-    Override the list's statuses to our custom workflow.
-    ClickUp supports overriding statuses at the list level via PUT /list/{list_id}
-    with: { "override_statuses": true, "statuses": [ ... ] }
-    """
+    """Override a list's statuses via PUT /list/{list_id} with override_statuses=true."""
     if dry:
         print(f"• DRY RUN: would set statuses on list {list_id}: {[s['status'] for s in statuses]}")
         return
     payload = {
         "override_statuses": True,
         "statuses": [
-            {
-                "status": s["status"],
-                "type": s["type"],       # "open" | "custom" | "closed"
-                "color": s["color"]
-            } for s in statuses
+            {"status": s["status"], "type": s["type"], "color": s["color"]}
+            for s in statuses
         ]
     }
     put_json(f"https://api.clickup.com/api/v2/list/{list_id}", token, payload)
     print(f"• Applied status workflow to list {list_id}: {[s['status'] for s in statuses]}")
 
-# ----------------------- Main -----------------------
+# ------------------------------- Main --------------------------------
 
 def main():
     p = argparse.ArgumentParser(description="ClickUp Scaffolding for Fido")
@@ -238,17 +255,18 @@ def main():
         if not args.token:
             print("Set CLICKUP_API_TOKEN first."); sys.exit(1)
         print(json.dumps(discover_teams(args.token), indent=2))
+        print("\nTip: choose the 'id' for the workspace you want and set CLICKUP_TEAM_ID.")
         sys.exit(0)
 
     token  = args.token
     team_id = args.team
     dry = args.dry_run
-    if not token:  print("❌ Missing CLICKUP_API_TOKEN"); sys.exit(1)
+    if not token:   print("❌ Missing CLICKUP_API_TOKEN"); sys.exit(1)
     if not team_id: print("❌ Missing CLICKUP_TEAM_ID"); sys.exit(1)
 
     print("\nClickUp Fido Ticketing System Setup")
     print("===================================")
-    print(f"Team ID: {team_id}  |  Dry run: {dry}")
+    print(f"Using team_id={team_id} | Dry run: {dry}")
 
     # Space → Folder → Lists
     space  = find_or_create_space(team_id, token, args.space_name, dry)
@@ -259,12 +277,12 @@ def main():
         l = find_or_create_list(folder["id"], token, name, dry)
         list_ids[key] = l["id"]
 
-    # Apply statuses to each list
+    # Apply statuses
     print_step("Apply status workflow to all lists")
     for key, lid in list_ids.items():
         apply_status_workflow_to_list(lid, token, STATUS_WORKFLOW, dry)
 
-    # Create/reuse fields on each list; collect IDs & option IDs
+    # Create/reuse fields; collect IDs & option IDs
     fields_cfg = {"lists": {k: list_ids[k] for k in list_ids}, "fields": {}, "options": {}}
     option_map = {"market_code": {}, "priority": {}, "issue_type": {},
                   "inquiry_type": {}, "change_type": {}, "recycling": {}}
@@ -303,7 +321,8 @@ def main():
                 for o in opts:
                     name = o.get("name") or o.get("label")
                     oid  = o.get("id")
-                    if name and oid: m[name] = oid
+                    if name and oid:
+                        m[name] = oid
                 if normalized in option_map:
                     option_map[normalized].update(m)
 
@@ -341,6 +360,7 @@ def main():
             "statuses": [s["status"] for s in STATUS_WORKFLOW]
         }, f, indent=2)
     print("• Wrote clickup-config.json")
+
     print("\n✅ Scaffolding complete (idempotent). Safe to re-run anytime.")
 
 if __name__ == "__main__":
